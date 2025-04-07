@@ -1,185 +1,211 @@
 #!/bin/bash
 
-# Complete Bug Bounty Recon & Vulnerability Scan Script
-# Author: @YourHandleHere
-# Version: 1.3
+# Professional Bug Bounty Reconnaissance & Vulnerability Scanner (Amass-Free)
+# Author: Security Researcher
+# Version: 2.2
+# Last Modified: $(date +%Y-%m-%d)
 
 # === Configuration ===
 if [ -z "$1" ]; then
-    echo "Usage: $0 <domain>"
+    echo "Usage: $0 <domain> [--aggressive]"
+    echo "Options:"
+    echo "  --aggressive  Enable intrusive checks (use with caution)"
     exit 1
 fi
 
-domain=$1
-output_dir="recon_scan_$domain"
-mkdir -p $output_dir
+# Initialize variables
+DOMAIN=$1
+AGGRESSIVE_MODE=false
+[[ "$2" == "--aggressive" ]] && AGGRESSIVE_MODE=true
 
-rate_limit="75"  # Conservative RPM for financial targets
+OUTPUT_DIR="recon_${DOMAIN}_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "${OUTPUT_DIR}/logs" "${OUTPUT_DIR}/scans" "${OUTPUT_DIR}/exports"
 
-# === 1. Subdomain Enumeration ===
-echo "[+] Enumerating subdomains..."
-{
-    subfinder -d $domain -silent
-    assetfinder --subs-only $domain
-    curl -s "https://crt.sh/?q=%25.$domain&output=json" | jq -r '.[].name_value' | sed 's/\*\.//g'
-} | sort -u > $output_dir/all_subs.txt
+# Rate limiting configuration
+RATE_LIMIT="75"
+THREADS=20
+TIMEOUT=10
 
-# === 2. Live Subdomains ===
-echo "[+] Probing for live subdomains..."
-cat $output_dir/all_subs.txt | httpx -silent -threads 20 -rate-limit $rate_limit -status-code -title -tech-detect -json -o $output_dir/live.json
-jq -r '.url' $output_dir/live.json > $output_dir/live.txt
+# Logging function
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "${OUTPUT_DIR}/logs/execution.log"
+}
 
-# === 3. URL Collection ===
-echo "[+] Collecting historical URLs..."
-{
-    cat $output_dir/live.txt | waybackurls
-    cat $output_dir/live.txt | gau --threads 20 --subs
-    katana -list $output_dir/live.txt -jc -kf all -d 3 -silent -o $output_dir/katana.txt
-} | sort -u > $output_dir/all_urls.txt
+# Error handling
+error_exit() {
+    log "ERROR: $1"
+    exit 1
+}
 
-# === 4. Parameter Discovery ===
-echo "[+] Extracting parameters..."
-{
-    paramspider -d $domain -o $output_dir/paramspider.txt
-    cat $output_dir/all_urls.txt | grep "=" | unfurl -u keys
-    cat $output_dir/all_urls.txt | grep "=" | unfurl -u keypairs
-} | sort -u > $output_dir/urls_with_params.txt
+# Dependency check (Amass removed)
+check_dependencies() {
+    declare -a TOOLS=("subfinder" "assetfinder" "httpx" "waybackurls" "gau" "katana" "paramspider" "nuclei" "ffuf" "jq")
+    for tool in "${TOOLS[@]}"; do
+        if ! command -v "$tool" &> /dev/null; then
+            error_exit "Missing dependency: $tool"
+        fi
+    done
+}
 
-# === 5. IDOR Detection ===
-echo "[+] Searching for IDOR-prone parameters..."
-{
-    cat $output_dir/urls_with_params.txt | grep -Ei 'id=|user=|account=|uid=|profile=|order=|number=|customer=|client='
-    cat $output_dir/urls_with_params.txt | grep -Ei 'ssn=|credit=|score=|report=|birth=|dob=|address='
-} | sort -u > $output_dir/idor_candidates.txt
+# Cleanup function
+cleanup() {
+    log "Cleaning temporary files..."
+    find "${OUTPUT_DIR}" -type f -name "*.tmp" -delete
+}
 
-# === 6. SSRF Detection ===
-echo "[+] Scanning for SSRF vulnerabilities..."
-cat $output_dir/all_urls.txt | grep -i "url=" | while read url; do
-    payload="http://127.0.0.1:80"
-    response=$(curl -X GET -d "url=$payload" -s "$url")
-    if echo "$response" | grep -i "root:"; then
-        echo "$url is vulnerable to SSRF" >> $output_dir/ssrf_candidates.txt
-    fi
-done
+# Main execution
+main() {
+    log "Starting reconnaissance on: ${DOMAIN}"
+    check_dependencies
+    trap cleanup EXIT
 
-# === 7. Command Injection Detection ===
-echo "[+] Scanning for Command Injection vulnerabilities..."
-cat $output_dir/all_urls.txt | while read url; do
-    payload="; ls"
-    response=$(curl -X GET -d "input=$payload" -s "$url")
-    if echo "$response" | grep -i "bin" || echo "$response" | grep -i "ls"; then
-        echo "$url is vulnerable to Command Injection" >> $output_dir/command_injection_candidates.txt
-    fi
-done
+    # === Phase 1: Subdomain Enumeration ===
+    log "Phase 1/8: Subdomain Discovery"
+    {
+        log "Running subfinder..."
+        subfinder -d "${DOMAIN}" -silent -o "${OUTPUT_DIR}/scans/subfinder.tmp"
+        
+        log "Running assetfinder..."
+        assetfinder --subs-only "${DOMAIN}" > "${OUTPUT_DIR}/scans/assetfinder.tmp"
+        
+        log "Querying crt.sh..."
+        curl -s "https://crt.sh/?q=%25.${DOMAIN}&output=json" | jq -r '.[].name_value' | sed 's/\*\.//g' > "${OUTPUT_DIR}/scans/crtsh.tmp"
+    } 2>> "${OUTPUT_DIR}/logs/subdomains.log"
 
-# === 8. SQL Injection Detection ===
-echo "[+] Scanning for SQL Injection vulnerabilities..."
-cat $output_dir/all_urls.txt | while read url; do
-    payload="' OR 1=1 -- "
-    response=$(curl -X GET -d "input=$payload" -s "$url")
-    if echo "$response" | grep -i "error" || echo "$response" | grep -i "syntax"; then
-        echo "$url is vulnerable to SQL Injection" >> $output_dir/sql_injection_candidates.txt
-    fi
-done
+    # Merge and deduplicate
+    cat "${OUTPUT_DIR}"/scans/*.tmp | sort -u > "${OUTPUT_DIR}/scans/all_subdomains.txt"
+    log "Found $(wc -l < "${OUTPUT_DIR}/scans/all_subdomains.txt") unique subdomains"
 
-# === 9. Reflected XSS Detection ===
-echo "[+] Scanning for Reflected XSS vulnerabilities..."
-cat $output_dir/all_urls.txt | while read url; do
-    payload="<script>alert('XSS')</script>"
-    response=$(curl -X GET -d "input=$payload" -s "$url")
-    if echo "$response" | grep -i "XSS"; then
-        echo "$url is vulnerable to Reflected XSS" >> $output_dir/xss_candidates.txt
-    fi
-done
+    # === Phase 2: Live Host Verification ===
+    log "Phase 2/8: Live Host Detection"
+    httpx -l "${OUTPUT_DIR}/scans/all_subdomains.txt" \
+        -silent \
+        -threads "${THREADS}" \
+        -rate-limit "${RATE_LIMIT}" \
+        -timeout "${TIMEOUT}" \
+        -status-code \
+        -title \
+        -tech-detect \
+        -json \
+        -o "${OUTPUT_DIR}/scans/live_hosts.json" \
+        2>> "${OUTPUT_DIR}/logs/httpx.log"
 
-# === 10. Open Redirect Detection ===
-echo "[+] Scanning for Open Redirect vulnerabilities..."
-cat $output_dir/all_urls.txt | grep -i "redirect=" | while read url; do
-    payload="http://evil.com"
-    response=$(curl -X GET -d "redirect=$payload" -s "$url")
-    if echo "$response" | grep -i "evil.com"; then
-        echo "$url is vulnerable to Open Redirect" >> $output_dir/open_redirect_candidates.txt
-    fi
-done
+    jq -r '.url' "${OUTPUT_DIR}/scans/live_hosts.json" > "${OUTPUT_DIR}/scans/live_hosts.txt"
+    log "Identified $(wc -l < "${OUTPUT_DIR}/scans/live_hosts.txt") live hosts"
 
-# === 11. CSRF Detection ===
-echo "[+] Scanning for CSRF vulnerabilities..."
-cat $output_dir/all_urls.txt | while read url; do
-    csrf_token=$(curl -s "$url" | grep -oP 'name="csrf_token" value="\K[^"]+')
-    if [ -z "$csrf_token" ]; then
-        echo "$url might be vulnerable to CSRF" >> $output_dir/csrf_candidates.txt
-    fi
-done
+    # === Phase 3: URL Collection ===
+    log "Phase 3/8: Historical URL Collection"
+    {
+        log "Querying Wayback Machine..."
+        waybackurls < "${OUTPUT_DIR}/scans/live_hosts.txt" > "${OUTPUT_DIR}/scans/wayback.tmp"
+        
+        log "Running GAU..."
+        gau --subs "${DOMAIN}" > "${OUTPUT_DIR}/scans/gau.tmp"
+        
+        log "Running Katana..."
+        katana -list "${OUTPUT_DIR}/scans/live_hosts.txt" -jc -kf all -d 3 -silent -o "${OUTPUT_DIR}/scans/katana.tmp"
+    } 2>> "${OUTPUT_DIR}/logs/urls.log"
 
-# === 12. Directory Traversal Detection ===
-echo "[+] Scanning for Directory Traversal vulnerabilities..."
-cat $output_dir/all_urls.txt | while read url; do
-    payload="../etc/passwd"
-    response=$(curl -X GET -d "input=$payload" -s "$url")
-    if echo "$response" | grep -i "root:"; then
-        echo "$url is vulnerable to Directory Traversal" >> $output_dir/directory_traversal_candidates.txt
-    fi
-done
+    sort -u "${OUTPUT_DIR}"/scans/*.tmp > "${OUTPUT_DIR}/scans/all_urls.txt"
+    log "Collected $(wc -l < "${OUTPUT_DIR}/scans/all_urls.txt") unique URLs"
 
-# === 13. XML External Entity (XXE) Detection ===
-echo "[+] Scanning for XXE vulnerabilities..."
-cat $output_dir/all_urls.txt | while read url; do
-    payload="<!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><foo>&xxe;</foo>"
-    response=$(curl -X POST -d "xml=$payload" -s "$url")
-    if echo "$response" | grep -i "root:"; then
-        echo "$url is vulnerable to XXE" >> $output_dir/xxe_candidates.txt
-    fi
-done
+    # === Phase 4: Parameter Extraction ===
+    log "Phase 4/8: Parameter Discovery"
+    {
+        log "Running ParamSpider..."
+        paramspider -d "${DOMAIN}" -o "${OUTPUT_DIR}/scans/paramspider.tmp"
+        
+        log "Extracting parameters..."
+        grep "=" "${OUTPUT_DIR}/scans/all_urls.txt" | unfurl -u keys > "${OUTPUT_DIR}/scans/params.tmp"
+        grep "=" "${OUTPUT_DIR}/scans/all_urls.txt" | unfurl -u keypairs >> "${OUTPUT_DIR}/scans/params.tmp"
+    } 2>> "${OUTPUT_DIR}/logs/parameters.log"
 
-# === 14. Fuzzing ===
-echo "[+] Starting focused fuzzing..."
-mkdir -p $output_dir/ffuf
-for url in $(cat $output_dir/live.txt); do
-    domain_clean=$(echo $url | sed 's/https\?:\/\///g' | tr "/" "_")
+    sort -u "${OUTPUT_DIR}/scans/params.tmp" > "${OUTPUT_DIR}/scans/parameterized_urls.txt"
+    log "Extracted $(wc -l < "${OUTPUT_DIR}/scans/parameterized_urls.txt") parameterized URLs"
+
+    # === Phase 5: Vulnerability Scanning ===
+    log "Phase 5/8: Automated Vulnerability Scanning"
     
-    # Focus on financial-related endpoints
-    ffuf -u "$url/FUZZ" -w /usr/share/wordlists/seclists/Discovery/Web-Content/financial.txt \
-        -t 20 -rate $rate_limit -o "$output_dir/ffuf/${domain_clean}_financial.json" -of json
+    # IDOR Detection
+    log "Scanning for IDOR vulnerabilities..."
+    grep -Ei 'id=|user=|account=|uid=|profile=|order=|number=|customer=|client=' "${OUTPUT_DIR}/scans/parameterized_urls.txt" > "${OUTPUT_DIR}/scans/idor_candidates.txt"
+    grep -Ei 'ssn=|credit=|score=|report=|birth=|dob=|address=' "${OUTPUT_DIR}/scans/parameterized_urls.txt" >> "${OUTPUT_DIR}/scans/idor_candidates.txt"
+
+    # Nuclei Scans
+    log "Running comprehensive Nuclei scans..."
+    declare -a NUCLEI_TEMPLATES=(
+        "~/nuclei-templates/sql-injection/"
+        "~/nuclei-templates/xss/"
+        "~/nuclei-templates/api/"
+        "~/nuclei-templates/ssrf/"
+        "~/nuclei-templates/authentication/"
+    )
     
-    # Standard small wordlist for general coverage
-    ffuf -u "$url/FUZZ" -w /usr/share/wordlists/dirbuster/directory-list-2.3-small.txt \
-        -t 20 -rate $rate_limit -o "$output_dir/ffuf/${domain_clean}_general.json" -of json
-done
+    for template in "${NUCLEI_TEMPLATES[@]}"; do
+        nuclei -l "${OUTPUT_DIR}/scans/live_hosts.txt" \
+            -t "${template}" \
+            -rate-limit "${RATE_LIMIT}" \
+            -o "${OUTPUT_DIR}/scans/nuclei_results.txt" \
+            -silent \
+            2>> "${OUTPUT_DIR}/logs/nuclei.log"
+    done
 
-# === 15. Nuclei Targeted Scanning ===
-echo "[+] Running targeted scans..."
-{
-    nuclei -l $output_dir/live.txt -t ~/nuclei-templates/financial/ -rate-limit $rate_limit
-    nuclei -l $output_dir/live.txt -t ~/nuclei-templates/authentication/ -rate-limit $rate_limit
-    nuclei -l $output_dir/live.txt -t ~/nuclei-templates/api/ -rate-limit $rate_limit
-} > $output_dir/nuclei_results.txt
+    # === Phase 6: Content Discovery ===
+    log "Phase 6/8: Directory Bruteforcing"
+    mkdir -p "${OUTPUT_DIR}/ffuf"
+    
+    while read -r url; do
+        domain_clean=$(echo "${url}" | sed 's~https\?://~~g' | tr "/" "_")
+        
+        log "Scanning ${url} with FFUF..."
+        ffuf -u "${url}/FUZZ" \
+            -w /usr/share/wordlists/seclists/Discovery/Web-Content/raft-large-words.txt \
+            -t "${THREADS}" \
+            -rate-limit "${RATE_LIMIT}" \
+            -timeout "${TIMEOUT}" \
+            -o "${OUTPUT_DIR}/ffuf/${domain_clean}.json" \
+            -of json \
+            -s \
+            2>> "${OUTPUT_DIR}/logs/ffuf.log"
+    done < "${OUTPUT_DIR}/scans/live_hosts.txt"
 
-# === 16. API Endpoint Discovery ===
-echo "[+] Identifying API endpoints..."
-cat $output_dir/all_urls.txt | grep -i "api" > $output_dir/api_endpoints.txt
-cat $output_dir/live.json | jq -r 'select(.tech_detect | contains("api")) | .url' >> $output_dir/api_endpoints.txt
+    # === Phase 7: Technology Analysis ===
+    log "Phase 7/8: Technology Stack Analysis"
+    jq -r '.tech_detect | select(. != null) | [.url, .tech] | @tsv' "${OUTPUT_DIR}/scans/live_hosts.json" > "${OUTPUT_DIR}/exports/technology_stack.tsv"
 
-# === 17. Report Generation ===
-echo "[+] Generating summary report..."
-{
-    echo "Complete Bug Bounty Recon Report for $domain"
-    echo "Generated on $(date)"
-    echo ""
-    echo "=== Summary ==="
-    echo "Subdomains found: $(wc -l < $output_dir/all_subs.txt)"
-    echo "Live hosts: $(wc -l < $output_dir/live.txt)"
-    echo "URLs collected: $(wc -l < $output_dir/all_urls.txt)"
-    echo "Parameters found: $(wc -l < $output_dir/urls_with_params.txt)"
-    echo "IDOR candidates: $(wc -l < $output_dir/idor_candidates.txt)"
-    echo "SSRF candidates: $(wc -l < $output_dir/ssrf_candidates.txt)"
-    echo "Command Injection candidates: $(wc -l < $output_dir/command_injection_candidates.txt)"
-    echo "SQL Injection candidates: $(wc -l < $output_dir/sql_injection_candidates.txt)"
-    echo "Reflected XSS candidates: $(wc -l < $output_dir/xss_candidates.txt)"
-    echo "Open Redirect candidates: $(wc -l < $output_dir/open_redirect_candidates.txt)"
-    echo "CSRF candidates: $(wc -l < $output_dir/csrf_candidates.txt)"
-    echo "Directory Traversal candidates: $(wc -l < $output_dir/directory_traversal_candidates.txt)"
-    echo "XXE candidates: $(wc -l < $output_dir/xxe_candidates.txt)"
-    echo "API endpoints: $(wc -l < $output_dir/api_endpoints.txt)"
-} > $output_dir/report.txt
+    # === Phase 8: Reporting ===
+    log "Phase 8/8: Report Generation"
+    {
+        echo "# Comprehensive Reconnaissance Report"
+        echo "## Target: ${DOMAIN}"
+        echo "## Date: $(date)"
+        echo ""
+        echo "## Key Statistics"
+        echo "- Subdomains Discovered: $(wc -l < "${OUTPUT_DIR}/scans/all_subdomains.txt")"
+        echo "- Live Hosts Identified: $(wc -l < "${OUTPUT_DIR}/scans/live_hosts.txt")"
+        echo "- Unique URLs Collected: $(wc -l < "${OUTPUT_DIR}/scans/all_urls.txt")"
+        echo "- Parameterized Endpoints: $(wc -l < "${OUTPUT_DIR}/scans/parameterized_urls.txt")"
+        echo ""
+        echo "## Critical Findings"
+        echo "- IDOR Candidates: $(wc -l < "${OUTPUT_DIR}/scans/idor_candidates.txt")"
+        echo "- SQL Injection Findings: $(grep -c "sql-injection" "${OUTPUT_DIR}/scans/nuclei_results.txt")"
+        echo "- XSS Vulnerabilities: $(grep -c "xss" "${OUTPUT_DIR}/scans/nuclei_results.txt")"
+        echo "- API Security Issues: $(grep -c "api" "${OUTPUT_DIR}/scans/nuclei_results.txt")"
+        echo ""
+        echo "## Recommended Actions"
+        echo "1. Prioritize manual verification of high-risk findings"
+        echo "2. Conduct authenticated testing on identified endpoints"
+        echo "3. Perform business logic testing on payment/order flows"
+        echo ""
+        echo "Full results available in: ${OUTPUT_DIR}"
+    } > "${OUTPUT_DIR}/report.md"
 
-echo "[+] Recon complete. All data saved in $output_dir/"
+    # Generate CSV exports
+    echo "url,status_code,title,technologies" > "${OUTPUT_DIR}/exports/live_hosts.csv"
+    jq -r '[.url, .status_code, .title, .tech_detect? // ""] | @csv' "${OUTPUT_DIR}/scans/live_hosts.json" >> "${OUTPUT_DIR}/exports/live_hosts.csv"
+
+    log "Reconnaissance complete. Results saved to: ${OUTPUT_DIR}"
+    log "Report generated: ${OUTPUT_DIR}/report.md"
+}
+
+main
